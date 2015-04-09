@@ -1,0 +1,70 @@
+#!/bin/bash
+#PBS -N ARC1
+#PBS -q qexp
+#PBS -l walltime=00:10:00
+#PBS -l select=1:ncpus=16
+#PBS -o /dev/null
+#PBS -e /dev/null
+
+module load hdf5/1.8.13
+module load intel/14.0.1
+
+cd "$PBS_O_WORKDIR" #go into the folder from which this script was started
+
+declare -a threads=(2 3 4 5 6 7 8 9 10 11 12 13 14 15 16)  #number of threads used
+declare -a sizes=(64 128 256 512 1024)    #domain sizes
+
+
+
+stdoutFile="out.csv"       #stdout output from this script goes here
+stderrFile="err.txt"       #stderr output
+jobName=`qstat -u $USER | grep -E "^[0-9]+.*$" | cut -f 1 -d " " | tail -1`
+playground=/lscratch/${jobName} #here the hdf5 files  are stored (local hard drive)
+
+
+#CSV output header
+echo "domainSize;nIterations;nThreads;diskWriteIntensity;airflow;materialFile;\
+simulationMode;simulationOutputFile;avgColumnTemperature;totalTime;\
+iterationTime"  >> ${stdoutFile}
+      
+
+#export KMP_AFFINITY=compact #binds each thread to its core, may improve performance
+diskWriteIntensity=25      
+
+for size in ${sizes[*]} 
+do
+  #calculate the "appropriate" number of iterations (by voko) so that 
+  #the program runs long enough to measure accurate times
+  nIterations=`expr $((10000000/$size))`
+  
+  #generate input file for the simulation (material properties)
+  ../DataGenerator/arc_generator -o ${playground}/tmp_material.h5 -N ${size} -H 100 -C 20 > /dev/null 2>/dev/null
+  
+  #run sequential version for given domain size 
+  ../Sources/arc_proj01 -b -n $nIterations -m 0 -w $diskWriteIntensity -t 1 -i ${playground}/tmp_material.h5 -o ${playground}/${size}x${size}_out.h5 >> ${stdoutFile}  2>>${stderrFile}
+  
+  #cleanup
+  rm -f ${playground}/${size}x${size}_out_seq.h5
+  
+  #run both parallel versions for given number of threads and domain size
+  for thread in ${threads[*]} 
+  do
+    #mode 1 - non-overlapped file output    
+    ../Sources/arc_proj01 -b -n $nIterations -m 1 -w $diskWriteIntensity -t ${thread} -i ${playground}/tmp_material.h5 -o ${playground}/${size}x${size}_${thread}threads_out.h5 >> ${stdoutFile}  2>>${stderrFile}
+    
+    #cleanup
+    rm -f ${playground}/${size}x${size}_${thread}threads_out_par1.h5   
+  done
+  
+  for thread in ${threads[*]} 
+  do  
+    #mode 2 - overlapped file output
+    ../Sources/arc_proj01 -b -n $nIterations -m 2 -w $diskWriteIntensity -t ${thread} -i ${playground}/tmp_material.h5 -o ${playground}/${size}x${size}_${thread}threads_out.h5 >> ${stdoutFile}  2>>${stderrFile} 
+    
+    #cleanup
+    rm -f ${playground}/${size}x${size}_${thread}threads_out_par2.h5            
+  done
+  
+  rm -f ${playground}/tmp_material.h5 
+done    
+
