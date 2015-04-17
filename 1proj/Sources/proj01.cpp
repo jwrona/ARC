@@ -292,9 +292,10 @@ void ParallelHeatDistributionNonOverlapped(float *                     parResult
   //--------------------------------------------------------------------------//
   //----- START OF THE SECTION WHERE STUDENTS MAY ADD/EDIT OMP PRAGMAS -------//
   //--------------------------------------------------------------------------//  
-  #pragma omp parallel
+  #pragma omp parallel private(iteration, i, j)
   {
-    for  (size_t i = 0; i < materialProperties.nGridPoints; i++)
+    #pragma omp for
+    for  (i = 0; i < materialProperties.nGridPoints; i++)
     {
       tempArray[i] = materialProperties.initTemp[i];
       parResult[i] = materialProperties.initTemp[i];
@@ -302,8 +303,10 @@ void ParallelHeatDistributionNonOverlapped(float *                     parResult
     
     for (iteration = 0; iteration < parameters.nIterations; iteration++)
     {
+      middleColAvgTemp = 0.0f;
       // calculate one iteration of the heat distribution
       // We skip the grid points at the edges
+      #pragma omp for
       for (i = 1; i < materialProperties.edgeSize - 1; i++)
       {
         for (j = 1; j < materialProperties.edgeSize - 1; j++)
@@ -343,37 +346,39 @@ void ParallelHeatDistributionNonOverlapped(float *                     parResult
       }// for i
 
       //calculate average temperature in the middle column
-      middleColAvgTemp = 0.0f;
-      
+      #pragma omp for reduction(+:middleColAvgTemp)
       for (i = 0; i < materialProperties.edgeSize; i++)
       {
         middleColAvgTemp += newTemp[i*materialProperties.edgeSize +
                             materialProperties.edgeSize/2];
       }
       
-      middleColAvgTemp /= materialProperties.edgeSize;                         
-
-      // Store time step in the output file if necessary
-      if ((file_id != H5I_INVALID_HID)  && ((iteration % parameters.diskWriteIntensity) == 0))
+      #pragma omp master
       {
-        StoreDataIntoFile(file_id,
-                          newTemp,
-                          materialProperties.edgeSize,
-                          iteration / parameters.diskWriteIntensity,
-                          iteration);
-      }
+        middleColAvgTemp /= materialProperties.edgeSize;                         
 
-      // swap new and old values
-      swap(newTemp, oldTemp);
-      
-      if ((iteration % (parameters.nIterations / 10l)) == 
-          ((parameters.nIterations / 10l) - 1l) && !parameters.batchMode)
-      {
-        printf("Progress %ld%% (Average Temperature %.2f degrees)\n", 
-               iteration / ( parameters.nIterations / 100) + 1, 
-               middleColAvgTemp);
-      }
-      
+        // Store time step in the output file if necessary
+        if ((file_id != H5I_INVALID_HID)  && ((iteration % parameters.diskWriteIntensity) == 0))
+        {
+          StoreDataIntoFile(file_id,
+                            newTemp,
+                            materialProperties.edgeSize,
+                            iteration / parameters.diskWriteIntensity,
+                            iteration);
+        }
+
+        // swap new and old values
+        swap(newTemp, oldTemp);
+        
+        if ((iteration % (parameters.nIterations / 10l)) == 
+            ((parameters.nIterations / 10l) - 1l) && !parameters.batchMode)
+        {
+          printf("Progress %ld%% (Average Temperature %.2f degrees)\n", 
+                 iteration / ( parameters.nIterations / 100) + 1, 
+                 middleColAvgTemp);
+        }
+      }// pragma master
+      #pragma omp barrier
     }// for iteration
   } // pragma parallel  
 
@@ -462,11 +467,146 @@ void ParallelHeatDistributionOverlapped(float *                     parResult,
   //--------------------------------------------------------------------------//
   //---------------------------- START OF YOUR CODE --------------------------//
   //--------------------------------------------------------------------------//   
-  
-  
-  //------ FILL IN THE PARALLEL CODE WITH OVERLAPPED FILE OUTPUT HERE --------//  
-  
-    
+  struct {
+    float *data;
+    size_t iteration;
+    bool no_more_data;
+    } buffer;
+
+  buffer.data = (float*)_mm_malloc(materialProperties.nGridPoints * sizeof(float), DATA_ALIGNMENT);
+  buffer.no_more_data = false;
+  bool buffer_full = false;
+
+  omp_set_nested(1);
+  omp_set_num_threads(omp_get_max_threads() - 1);
+
+  #pragma omp parallel sections num_threads(2)
+  {
+    /**************************************************************************/
+    #pragma omp section /* Computation section. */
+    {
+      #pragma omp parallel private(iteration, i, j)
+      {
+        #pragma omp for /* Memory initialization. */
+        for (i = 0; i < materialProperties.nGridPoints; ++i) {
+          tempArray[i] = materialProperties.initTemp[i];
+          parResult[i] = materialProperties.initTemp[i];
+        }
+
+        for (iteration = 0; iteration < parameters.nIterations; ++iteration) {
+	  middleColAvgTemp = 0.0f;
+          #pragma omp for /* Parallel loop through rows, serial through columns. */
+          for (i = 1; i < materialProperties.edgeSize - 1; ++i) {
+            for (j = 1; j < materialProperties.edgeSize - 1; ++j) {
+              const int center =  i * materialProperties.edgeSize + j;
+              const int top = center - materialProperties.edgeSize;
+              const int bottom = center + materialProperties.edgeSize;
+              const int left = center - 1;
+              const int right = center + 1;
+
+              // the reciprocal value of the sum of domain parameters for normalization
+              const float frec = 1.0f / (materialProperties.domainParams[top]    +
+                                         materialProperties.domainParams[bottom] +
+                                         materialProperties.domainParams[left]   +
+                                         materialProperties.domainParams[center] +
+                                         materialProperties.domainParams[right]);
+
+              // calculate new temperature in the grid point
+              float pointTemp = 
+                  oldTemp[top]    * materialProperties.domainParams[top]    * frec +
+                  oldTemp[bottom] * materialProperties.domainParams[bottom] * frec +
+                  oldTemp[left]   * materialProperties.domainParams[left]   * frec +
+                  oldTemp[right]  * materialProperties.domainParams[right]  * frec +
+        	        oldTemp[center] * materialProperties.domainParams[center] * frec;
+                      
+
+              // remove some of the heat due to air flow (5% of the new air)
+              pointTemp = (materialProperties.domainMap[center] == 0)  
+                          ? (parameters.airFlowRate * materialProperties.CoolerTemp) + 
+                            ((1.f - parameters.airFlowRate) * pointTemp)
+                          : pointTemp;
+
+              newTemp[center] = pointTemp;
+
+            }// for j
+          }// for i
+
+          #pragma omp for reduction(+:middleColAvgTemp) /* Sum of middle column cells temperature. */
+          for (i = 0; i < materialProperties.edgeSize; i++) {
+            middleColAvgTemp += newTemp[i * materialProperties.edgeSize + materialProperties.edgeSize / 2];
+          }
+
+          #pragma omp master
+          {
+            middleColAvgTemp /= materialProperties.edgeSize; /* From sum to average. */
+
+            if (iteration % parameters.diskWriteIntensity == 0) {
+              do { //wait until buffer is safe for writing
+                #pragma omp flush(buffer_full)
+              } while(buffer_full);
+
+	      memcpy(buffer.data, newTemp, materialProperties.nGridPoints * sizeof(float));
+              buffer.iteration = iteration;
+
+              buffer_full = true; //buffer is safe for reading now
+              #pragma omp flush(buffer_full, buffer)
+            }
+
+            if ((iteration % (parameters.nIterations / 10l)) == 
+                ((parameters.nIterations / 10l) - 1l) && !parameters.batchMode)
+            {
+              printf("Progress %ld%% (Average Temperature %.2f degrees)\n", 
+                     iteration / ( parameters.nIterations / 100) + 1, 
+                     middleColAvgTemp);
+            }
+
+	    //swap new and old values
+	    swap(newTemp, oldTemp);
+          }
+          #pragma omp barrier
+        }// for iterations
+      }// parallel
+
+      do { //wait until buffer is safe for writing
+        #pragma omp flush(buffer_full)
+      } while(buffer_full);
+      
+      buffer.no_more_data = true;
+      
+      buffer_full = true; //buffer is safe for reading now
+      #pragma omp flush(buffer_full, buffer)
+    } /* End of omputation section. */
+    /**************************************************************************/
+
+    /**************************************************************************/
+    #pragma omp section /* Disk write section. */
+    {
+      while (true) {
+        do { //wait until buffer is safe for reading
+          #pragma omp flush(buffer_full)
+        } while(!buffer_full);
+        #pragma omp flush(buffer)
+
+        if (buffer.no_more_data) {
+          break;
+        }
+
+        // Store time step in the output file if necessary
+        if (file_id != H5I_INVALID_HID)
+        {
+          StoreDataIntoFile(file_id, buffer.data, materialProperties.edgeSize,
+                            buffer.iteration / parameters.diskWriteIntensity,
+                            buffer.iteration);
+        }
+
+        buffer_full = false; //buffer is safe for writing now
+        #pragma omp flush(buffer_full)
+      }// while true
+    } /* End of disk write section. */
+    /**************************************************************************/
+  } // pragma parallel sections
+
+  _mm_free(buffer.data);
   //--------------------------------------------------------------------------//
   //---------------------------- END OF YOUR CODE ----------------------------//
   //--------------------------------------------------------------------------// 
