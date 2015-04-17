@@ -1,0 +1,48 @@
+#!/bin/bash
+#PBS -N ARC1_V_NOAFF_BG
+#PBS -q qexp
+#PBS -l select=1:ncpus=16
+
+cd "$PBS_O_WORKDIR" #go into the folder from which this script was started
+
+declare -a sizes=(1024 2048)    #domain sizes
+
+jobName=`qstat -u $USER | grep -E "^[0-9]+.*$" | cut -f 1 -d " " | tail -1`
+playground=/lscratch/${jobName} #here the hdf5 files  are stored (local hard drive)
+
+#CSV output header
+#echo "domainSize;nIterations;nThreads;diskWriteIntensity;airflow;materialFile;\
+#simulationMode;simulationOutputFile;avgColumnTemperature;totalTime;\
+#iterationTime"
+      
+#export KMP_AFFINITY=compact #binds each thread to its core, may improve performance
+diskWriteIntensity=25
+
+for size in ${sizes[*]} 
+do
+  nIterations=`expr $((10000000/$size))`
+  
+  ../DataGenerator/arc_generator -o ${playground}/tmp_material.h5 -N ${size} -H 100 -C 20 > /dev/null 2>/dev/null
+  
+  echo "${size}, non-overlapped"
+  for thread in {2..16}
+  do
+    ../Sources/arc_proj01 -v -n $nIterations -m 1 -w $diskWriteIntensity -t ${thread} -i ${playground}/tmp_material.h5 -o ${playground}/${size}x${size}_${thread}threads_out.h5
+    
+    #cleanup
+    rm -f ${playground}/${size}x${size}_${thread}threads_out_par1.h5   
+  done
+  printf "\n\n"
+
+  echo "${size}, overlapped"
+  for thread in {2..16} 
+  do  
+    ../Sources/arc_proj01 -v -n $nIterations -m 2 -w $diskWriteIntensity -t ${thread} -i ${playground}/tmp_material.h5 -o ${playground}/${size}x${size}_${thread}threads_out.h5
+    
+    #cleanup
+    rm -f ${playground}/${size}x${size}_${thread}threads_out_par2.h5            
+  done
+  printf "\n\n"
+  
+  rm -f ${playground}/tmp_material.h5 
+done

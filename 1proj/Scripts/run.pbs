@@ -1,13 +1,12 @@
 #!/bin/bash
 #PBS -N ARC1
 #PBS -q qexp
-#PBS -l walltime=00:10:00
 #PBS -l select=1:ncpus=16
 #PBS -o /dev/null
 #PBS -e /dev/null
 
-module load hdf5/1.8.13
-module load intel/14.0.1
+#module load hdf5/1.8.13
+#module load intel/14.0.1
 
 cd "$PBS_O_WORKDIR" #go into the folder from which this script was started
 
@@ -28,7 +27,7 @@ simulationMode;simulationOutputFile;avgColumnTemperature;totalTime;\
 iterationTime"  >> ${stdoutFile}
       
 
-#export KMP_AFFINITY=compact #binds each thread to its core, may improve performance
+export KMP_AFFINITY=compact #binds each thread to its core, may improve performance
 diskWriteIntensity=25      
 
 for size in ${sizes[*]} 
