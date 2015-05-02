@@ -1,0 +1,44 @@
+#!/bin/bash
+#PBS -N ARC2_SEQ
+#PBS -q qexp
+#PBS -l walltime=00:20:00
+#PBS -l select=1:ncpus=16:mpiprocs=16:ompthreads=1
+
+module load hdf5/1.8.13
+module load intel/15.2.164
+module load impi
+
+# go into the folder from which this script was started
+cd "$PBS_O_WORKDIR"
+
+# domain sizes
+declare -a sizes=(256 512 1024 2048 4096)
+
+# stdout and stderr outputs
+stdoutFile="out_seq.csv"
+stderrFile="err_seq.txt"
+
+# get job name
+jobName=`qstat -u $USER | grep -E "^[0-9]+.*$" | cut -f 1 -d " " | tail -1`
+# here the hdf5 files are stored (local hard drive)
+playground=/lscratch/${jobName}
+
+# CSV output header
+echo "domainSize;nIterations;diskWriteIntensity;airflow;materialFile;simulationMode;simulationOutputFile;middleColAvgTemp;totalTime;iterationTime" > ${stdoutFile}
+
+# disk write intensity
+diskWriteIntensity=50
+
+for size in ${sizes[*]} 
+do
+  # calculate the "appropriate" number of iterations so that
+  # the program runs long enough to measure accurate times
+  nIterations=`expr $((10000000/$size))`
+
+  # run sequential version for given domain size
+  ../Sources/arc_proj02 -b -n $nIterations -m 0 -w $diskWriteIntensity -i input_data_${size}.h5 >> ${stdoutFile} 2>> ${stderrFile}
+  ../Sources/arc_proj02 -b -n $nIterations -m 0 -w $diskWriteIntensity -i input_data_${size}.h5 -o ${playground}/${size}x${size}_out.h5 >> ${stdoutFile} 2>> ${stderrFile}
+
+  # cleanup
+  rm -f ${playground}/${size}x${size}_out.h5
+done
