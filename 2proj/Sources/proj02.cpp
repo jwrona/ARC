@@ -260,6 +260,58 @@ void ParallelHeatDistribution(float                     *parResult,
   //--------------------------------------------------------------------------//
   //---------------- THE SECTION WHERE STUDENTS MAY ADD CODE -----------------//
   //--------------------------------------------------------------------------//
+#define WORLD_ROOT 0
+
+  const int rank_world = MPI::COMM_WORLD.Get_rank();
+  const int size_world = MPI::COMM_WORLD.Get_size();
+
+  //create a new output hdf5 file
+  if (rank_world == WORLD_ROOT) {
+    hid_t file_id = H5I_INVALID_HID;
+    if (outputFileName != "")
+    {
+        if (outputFileName.find(".h5") == string::npos) {
+            outputFileName.append("_par.h5");
+        } else {
+            outputFileName.insert(outputFileName.find_last_of("."), "_par");
+        }
+
+        file_id = H5Fcreate(outputFileName.c_str(), H5F_ACC_TRUNC, H5P_DEFAULT,
+		H5P_DEFAULT);
+        if (file_id < 0) ios::failure("Cannot create output file");
+    }
+  }
+
+  std::size_t row_cpus, col_cpus;
+  if (size_world <= 2) { //one or two cpus
+      row_cpus = 1;
+  } else {
+      const std::size_t log_cpus = static_cast<std::size_t>(std::log2(size_world));
+      row_cpus = (log_cpus % 2) ? log_cpus - 1 : log_cpus;
+  }
+  col_cpus = size_world / row_cpus;
+
+  const int dims[] = {static_cast<const int>(row_cpus), static_cast<const int>(col_cpus)};
+  const bool periods[] = {false, false};
+  const int ndims = 2;
+
+  auto grid_comm = MPI::COMM_WORLD.Create_cart(ndims, dims, periods, true);
+
+  int coords[ndims];
+  int rank_source, rank_dest;
+  grid_comm.Get_coords(rank_world, ndims, coords);
+  grid_comm.Shift(0, 1, rank_source, rank_dest);
+
+  for (int i = 0; i < size_world; ++i) {
+      if (rank_world == i) {
+	  std::cout << rank_world << ": " << coords[0] << ", " << coords[1] << "\t" << rank_source << " -> " << rank_dest << std::endl << std::flush;
+      }
+      MPI::COMM_WORLD.Barrier();
+  }
+
+
+  //const std::size_t x = materialProperties.edgeSize / row_cpus;
+  //const std::size_t y = materialProperties.edgeSize / col_cpus;
 } // end of ParallelHeatDistribution
 //------------------------------------------------------------------------------
 
