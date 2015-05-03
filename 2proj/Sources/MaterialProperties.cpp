@@ -15,10 +15,10 @@
  * This implementation file defines the class for material properties
  */
 
+#include <hdf5.h>
 #include <immintrin.h>
 #include <iostream>
 #include <stdexcept>
-#include <hdf5.h>
 
 #include "MaterialProperties.h"
 #include "BasicRoutines.h"
