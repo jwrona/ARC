@@ -263,9 +263,15 @@ void ParallelHeatDistribution(float                     *parResult,
 #define ROOT_PROC 0
 #define TAG 0
 
-#define NDIMS 2
 #define DIM_X 0
 #define DIM_Y 1
+#define NDIMS 2
+
+#define HALO_LEFT  0
+#define HALO_RIGHT 1
+#define HALO_UPPER 2
+#define HALO_LOWER 3
+#define NHALOS     4
 
   const int world_rank = MPI::COMM_WORLD.Get_rank();
   const int world_size = MPI::COMM_WORLD.Get_size();
@@ -274,6 +280,8 @@ void ParallelHeatDistribution(float                     *parResult,
     std::size_t size[NDIMS]; //one tile size
     std::size_t data_size[NDIMS]; //actual data dimensions
     float *data_old, *data_new; //one tile t and t + 1 data
+    std::size_t halo_send_offset[NHALOS]; //halo zones offsets
+    std::size_t halo_recv_offset[NHALOS]; //halo zones offsets
   } tile;
 
   /* Create a new output hdf5 file. Root processor only. */
@@ -295,15 +303,13 @@ void ParallelHeatDistribution(float                     *parResult,
 
   /* Partition input data grid into smaller grids - tiles. All processors. */
   std::size_t tiles_per[NDIMS]; //tiles per one dimension
-  if (world_size <= 2) { //one or two cpus -> one tile per row
-      tiles_per[DIM_X] = 1;
-  } else {
-      auto log_cpus = static_cast<std::size_t>(std::log2(world_size)); //TODO SHIIIIIIIIIIIIT
-      tiles_per[DIM_X] = (log_cpus % 2) ? log_cpus - 1 : log_cpus;
-  }
+  tiles_per[DIM_X] = std::sqrt(world_size / (1 + (static_cast<std::size_t>(
+					  std::log2(world_size))& 1)));
   tiles_per[DIM_Y] = world_size / tiles_per[DIM_X];
 
-  /* Calculate tile dimensions and allocate memory for step t and t + 1. All processors. */
+  /* Fill tile struct: calculate tile dimensions, allocate memory for step t
+   * and t + 1, calculate halo zones offsets. All processors.
+   */
   tile.size[DIM_X] = materialProperties.edgeSize / tiles_per[DIM_X];
   tile.size[DIM_Y] = materialProperties.edgeSize / tiles_per[DIM_Y];
   tile.data_size[DIM_X] = tile.size[DIM_X] + 2; //for halo zones
@@ -312,22 +318,21 @@ void ParallelHeatDistribution(float                     *parResult,
 			  tile.data_size[DIM_Y] * sizeof(float), DATA_ALIGNMENT));
   tile.data_new = static_cast<float *>(_mm_malloc(tile.data_size[DIM_X] *
 			  tile.data_size[DIM_Y] * sizeof(float), DATA_ALIGNMENT));
+  tile.halo_send_offset[HALO_LEFT] = tile.data_size[DIM_X] + 1;
+  tile.halo_send_offset[HALO_RIGHT] = tile.data_size[DIM_X] * 2 - 2;
+  tile.halo_send_offset[HALO_UPPER] = tile.data_size[DIM_X] + 1;
+  tile.halo_send_offset[HALO_LOWER] = tile.data_size[DIM_X] * (tile.data_size[DIM_Y] - 2) + 1;
+
+  tile.halo_recv_offset[HALO_LEFT] = tile.data_size[DIM_X];
+  tile.halo_recv_offset[HALO_RIGHT] = tile.data_size[DIM_X] * 2 - 1;
+  tile.halo_recv_offset[HALO_UPPER] = 1;
+  tile.halo_recv_offset[HALO_LOWER] = tile.data_size[DIM_X] * (tile.data_size[DIM_Y] - 1) + 1;
 
   /* Create a new communicator - 2D grid Cartesian topology. All processors. */
-//  const int dims[NDIMS] = {static_cast<const int>(tiles_per[DIM_X]),
-//	  static_cast<const int>(tiles_per[DIM_Y])};
   const int dims[NDIMS] = {static_cast<const int>(tiles_per[DIM_X]),
 	  static_cast<const int>(tiles_per[DIM_Y])};
   const bool periods[NDIMS] = {false, false};
   auto grid_comm = MPI::COMM_WORLD.Create_cart(NDIMS, dims, periods, true);
-  if (world_rank == ROOT_PROC){
-	  printf("tiles_per[X] = %lu, tiles_per[Y] = %lu\n", tiles_per[DIM_X], tiles_per[DIM_Y]);
-	  printf("tile.size[X] = %lu, tile.size[Y] = %lu\n", tile.size[DIM_X], tile.size[DIM_Y]);
-	  printf("tile.data_size[X] = %lu, tile.data_size[Y] = %lu\n", tile.data_size[DIM_X], tile.data_size[DIM_Y]);
-	  const int grid_rank = grid_comm.Get_rank(), grid_size = grid_comm.Get_size();
-	  printf("grid_rank = %d, grid_size = %d\n", grid_rank, grid_size);
-  }
-  return;
   const int grid_rank = grid_comm.Get_rank(), grid_size = grid_comm.Get_size();
 
   /* Create a new MPI data type - subarray corresponding to one tile
@@ -336,20 +341,20 @@ void ParallelHeatDistribution(float                     *parResult,
   int sizes[NDIMS] = {materialProperties.edgeSize, materialProperties.edgeSize};
   int subsizes[NDIMS] = {tile.size[DIM_Y], tile.size[DIM_X]}; //rows, then cols
   int starts[NDIMS] = {0, 0};
-  auto mpi_src_tile_t = MPI::FLOAT.Create_subarray(NDIMS, sizes, subsizes,
-		  starts, MPI::ORDER_C);
-  mpi_src_tile_t = mpi_src_tile_t.Create_resized(0, tile.size[DIM_X] *
+  MPI::Datatype mpi_board_t = MPI::FLOAT.Create_subarray(NDIMS, sizes,
+		  subsizes, starts, MPI::ORDER_C);
+  mpi_board_t = mpi_board_t.Create_resized(0, tile.size[DIM_X] *
 		  sizeof(float));
-  mpi_src_tile_t.Commit();
+  mpi_board_t.Commit();
 
   /* Create a new MPI data type - subarray corresponding to one tile
-   * among halo zones. All processors. */
+   * in array with data and halo zones. All processors. */
   sizes[0] = tile.data_size[DIM_Y]; //rows first
   sizes[1] = tile.data_size[DIM_X]; //cols second
   starts[0] = starts[1] = 1; //leave halo zones untouched
-  auto mpi_dst_tile_t = MPI::FLOAT.Create_subarray(NDIMS, sizes, subsizes,
+  MPI::Datatype mpi_tile_t = MPI::FLOAT.Create_subarray(NDIMS, sizes, subsizes,
 		  starts, MPI::ORDER_C);
-  mpi_dst_tile_t.Commit();
+  mpi_tile_t.Commit();
 
   /* Calculate displacement in data board for each tile. Root processor only. */
   int sendcounts[grid_size], displs[grid_size];
@@ -364,18 +369,42 @@ void ParallelHeatDistribution(float                     *parResult,
     }
   }
 
-
-  /****************************************************************************/
+  /* Scatter board into tiles. All processors. */
   for (int i = 0; i < materialProperties.nGridPoints; ++i) {
     materialProperties.initTemp[i] = i;
   }
+  grid_comm.Scatterv(materialProperties.initTemp, sendcounts, displs,
+		  mpi_board_t, tile.data_old, 1, mpi_tile_t, ROOT_PROC);
 
-  grid_comm.Scatterv(materialProperties.initTemp, sendcounts, displs, mpi_src_tile_t,
-		  tile.data_old, 1, mpi_dst_tile_t, ROOT_PROC);
+  /* Create row and column halo data types. All processors. */
+  MPI::Datatype mpi_halo_t[NDIMS];
+  mpi_halo_t[DIM_X] = MPI::FLOAT.Create_vector(tile.size[DIM_Y], 1,
+		  tile.data_size[DIM_X]);
+  mpi_halo_t[DIM_Y] = MPI::FLOAT.Create_vector(1, tile.size[DIM_X],
+		  tile.data_size[DIM_X]);
+  mpi_halo_t[DIM_X].Commit();
+  mpi_halo_t[DIM_Y].Commit();
 
-  //printf("tiles_per[X] = %lu, tiles_per[Y] = %lu\n", tiles_per[DIM_X], tiles_per[DIM_Y]);
-  //printf("tile.size[X] = %lu, tile.size[Y] = %lu\n", tile.size[DIM_X], tile.size[DIM_Y]);
-  //printf("tile.data_size[X] = %lu, tile.data_size[Y] = %lu\n", tile.data_size[DIM_X], tile.data_size[DIM_Y]);
+  /* Send and reveive halo zones for the first time. All processors. */
+  for (std::size_t dim = 0, halo_index = 0; dim < NDIMS; dim++) { //X, Y
+    for (int dir = -1; dir <= 1; dir += 2, halo_index++) { //left/up, right/down
+      int rank_source, rank_dest;
+      grid_comm.Shift(dim, dir, rank_source, rank_dest);
+      grid_comm.Isend(tile.data_old + tile.halo_send_offset[halo_index], 1, mpi_halo_t[dim], rank_dest, TAG);
+    }
+  }
+  for (std::size_t dim = 0, halo_index = 0; dim < NDIMS; dim++) { //X, Y
+    for (int dir = 1; dir >= -1; dir -= 2, halo_index++) { //right/down, left/up
+      int rank_source, rank_dest;
+      grid_comm.Shift(dim, dir, rank_source, rank_dest);
+      grid_comm.Recv(tile.data_old + tile.halo_recv_offset[halo_index], 1, mpi_halo_t[dim], rank_source, TAG);
+    }
+  }
+
+
+  /****************************************************************************/
+
+
   for (int i = 0; i < grid_size; ++i) {
     if (grid_rank == i) {
       printf("rank %d:\n", grid_rank);
@@ -390,7 +419,23 @@ void ParallelHeatDistribution(float                     *parResult,
     }
     MPI::COMM_WORLD.Barrier();
   }
+  //printf("tiles_per[X] = %lu, tiles_per[Y] = %lu\n", tiles_per[DIM_X], tiles_per[DIM_Y]);
+  //printf("tile.size[X] = %lu, tile.size[Y] = %lu\n", tile.size[DIM_X], tile.size[DIM_Y]);
+  //printf("tile.data_size[X] = %lu, tile.data_size[Y] = %lu\n", tile.data_size[DIM_X], tile.data_size[DIM_Y]);
   /****************************************************************************/
+
+
+  /* Gather tiles into into board. All processors. */
+  grid_comm.Gatherv(tile.data_old, 1, mpi_tile_t, parResult, sendcounts,
+		  displs, mpi_board_t, ROOT_PROC);
+  if (world_rank == ROOT_PROC) {
+    for (int i = 0; i < materialProperties.edgeSize; ++i) {
+      for (int j = 0; j < materialProperties.edgeSize; ++j) {
+        printf("%3.0f ", parResult[i * materialProperties.edgeSize + j]);
+      }
+      putchar('\n');
+    }
+  }
 
 
   /* Free memory. All processors. */
