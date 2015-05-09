@@ -379,6 +379,7 @@ void fill_middle_col_struct(middle_col_struct &middle_col,
     middle_col.comm_size = middle_col.comm.Get_size();
     middle_col.comm_rank = middle_col.comm.Get_rank();
   }
+  middle_col.avg_temp = 0.0;
 }
 
 /**
@@ -619,7 +620,9 @@ void ParallelHeatDistribution(float                     *parResult,
 
   /* Print final result. */
   if (board.comm_rank == ROOT_PROC) {
-    grid.comm.Recv(&middle_col.avg_temp, 1, MPI::DOUBLE, middle_col.root_grid_rank, TAG);
+    if (parameters.nIterations > 0) {
+      grid.comm.Recv(&middle_col.avg_temp, 1, MPI::DOUBLE, middle_col.root_grid_rank, TAG);
+    }
     if (!parameters.batchMode) {
       printf("\nExecution time of parallel version %.5f\n", elapsed_time);
     } else {
