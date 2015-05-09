@@ -265,6 +265,12 @@ struct grid_struct {
   int comm_rank, comm_size;
 };
 
+struct middle_col_struct {
+  MPI::Intracomm comm;
+  int comm_rank, comm_size, root_grid_rank;
+  double avg_temp;
+};
+
 struct tile_struct {
   std::size_t size[NDIMS]; //one tile size
   std::size_t data_size[NDIMS]; //actual data dimensions
@@ -347,10 +353,11 @@ void fill_tile_struct(tile_struct &tile, const grid_struct grid,
   tile.data_end[DIM_Y] = tile.data_size[DIM_Y] - (1 + (tile.neigh_rank[LOWER] == MPI::PROC_NULL));
 }
 
-MPI::Intracomm create_middle_col_comm(const grid_struct grid, const std::size_t tiles[NDIMS])
+void fill_middle_col_struct(middle_col_struct &middle_col,
+		const grid_struct grid, const std::size_t tiles[NDIMS])
 {
   std::size_t index = 0;
-  int middle_col_ranks[tiles[DIM_Y]];
+  int middle_col_ranks[tiles[DIM_Y]], grid_root = ROOT_PROC;
 
   for (int rank = 0; rank < grid.comm_size; ++rank) {
     int rank_coords[NDIMS];
@@ -360,9 +367,18 @@ MPI::Intracomm create_middle_col_comm(const grid_struct grid, const std::size_t 
       middle_col_ranks[index++] = rank;
     }
   }
-  MPI::Group middle_col_group = grid.comm.Get_group().Incl(tiles[DIM_Y],
-		  middle_col_ranks);
-  return grid.comm.Create(middle_col_group);
+
+  MPI::Group grid_group = grid.comm.Get_group();
+  MPI::Group middle_col_group = grid_group.Incl(tiles[DIM_Y], middle_col_ranks);
+
+  middle_col_group.Translate_ranks(middle_col_group, 1, &grid_root, grid_group,
+		  &middle_col.root_grid_rank);
+  middle_col.comm = grid.comm.Create(middle_col_group);
+
+  if (middle_col.comm != MPI::COMM_NULL) {
+    middle_col.comm_size = middle_col.comm.Get_size();
+    middle_col.comm_rank = middle_col.comm.Get_rank();
+  }
 }
 
 /**
@@ -389,6 +405,7 @@ void ParallelHeatDistribution(float                     *parResult,
 
   tile_struct tile;
   grid_struct grid;
+  middle_col_struct middle_col;
 
   /* Create a new output hdf5 file. Root processor only. */
   hid_t file_id = H5I_INVALID_HID;
@@ -419,7 +436,7 @@ void ParallelHeatDistribution(float                     *parResult,
   fill_tile_struct(tile, grid, materialProperties.edgeSize, board.tiles);
 
   /* Create a new communicator for middle row. */
-  MPI::Intracomm middle_col_comm = create_middle_col_comm(grid, board.tiles);
+  fill_middle_col_struct(middle_col, grid, board.tiles);
 
   /* Create a new MPI data type - subarray corresponding to one tile
    * among whole data board.
@@ -495,10 +512,9 @@ void ParallelHeatDistribution(float                     *parResult,
 
   /* Start measuring time. */
   board.comm.Barrier();
-  double elapsed_time = MPI::Wtime(), middle_col_avg_temp = 0.0;
+  double elapsed_time = MPI::Wtime();
 
-
-  /****************************************************************************/
+  /* For all iterations. */
   for (std::size_t iter = 0; iter < parameters.nIterations; ++iter) {
     /* Conditionally compute and send halo zones. */
     if (tile.neigh_rank[LEFT] != MPI::PROC_NULL) { //do I have left neighbor?
@@ -548,43 +564,46 @@ void ParallelHeatDistribution(float                     *parResult,
     }
 
     /* Compute the average temperature in the middle column. */
-    if ((iter % (parameters.nIterations / 10l)) ==
-		    ((parameters.nIterations / 10l) - 1l) &&
-		    !parameters.batchMode)
-    {
-      if (middle_col_comm != MPI::COMM_NULL) {
-        double local_avg = 0.0, col_avg = 0.0;
-        const std::size_t middle_col_pos = (board.tiles[DIM_X] < 2) ?
-                tile.data_size[DIM_X] / 2 : 1;
+    if (middle_col.comm != MPI::COMM_NULL) {
+      double local_avg = 0.0;
+      const std::size_t middle_col_pos = (board.tiles[DIM_X] < 2) ?
+              tile.data_size[DIM_X] / 2 : 1;
 
-        for (std::size_t row = 1; row < tile.data_size[DIM_Y] - 1; ++row) {
-          local_avg += tile.data_new[row * tile.data_size[DIM_X] +
-		  middle_col_pos];
-        }
-        local_avg /= tile.size[DIM_Y];
+      for (std::size_t row = 1; row < tile.data_size[DIM_Y] - 1; ++row) {
+        local_avg += tile.data_new[row * tile.data_size[DIM_X] +
+      	  middle_col_pos];
+      }
+      local_avg /= tile.size[DIM_Y];
 
-        middle_col_comm.Reduce(&local_avg, &col_avg, 1, MPI::DOUBLE, MPI::SUM,
-			ROOT_PROC);
+      middle_col.comm.Reduce(&local_avg, &middle_col.avg_temp, 1, MPI::DOUBLE,
+		      MPI::SUM, ROOT_PROC);
+      middle_col.avg_temp /= middle_col.comm_size;
 
-        if (middle_col_comm.Get_rank() == ROOT_PROC) {
-          col_avg /= middle_col_comm.Get_size();
-          printf("it %lu/%lu: avg temp = %f\n", iter, parameters.nIterations,
-	  		col_avg);
-        }
+      if ((middle_col.comm_rank == ROOT_PROC) && 
+          	    (iter % (parameters.nIterations / 10l)) ==
+          	    ((parameters.nIterations / 10l) - 1l) &&
+          	    !parameters.batchMode) {
+        printf("it %lu/%lu: avg temp = %f\n", iter, parameters.nIterations,
+			middle_col.avg_temp);
+      }
+
+      if ((middle_col.comm_rank == ROOT_PROC) &&
+		      (iter == parameters.nIterations - 1)) {
+        grid.comm.Isend(&middle_col.avg_temp, 1, MPI::DOUBLE, ROOT_PROC, TAG);
       }
     }
 
-/*
-    // [c] Store time step in the output file if necessary
-    if ((file_id != H5I_INVALID_HID)  && ((iteration % parameters.diskWriteIntensity) == 0))
-    {
-      StoreDataIntoFile(file_id,
-                        newTemp,
-                        materialProperties.edgeSize,
-                        iteration / parameters.diskWriteIntensity,
-                        iteration);
+    /* Store time step in the output file if necessary. */
+    if ((iter % parameters.diskWriteIntensity) == 0) {
+      /* Gather tiles into board. */
+      grid.comm.Gatherv(tile.data_new, 1, mpi_tile_data_t, parResult,
+		      sendcounts, displs, mpi_board_t, ROOT_PROC);
+      
+      if (file_id != H5I_INVALID_HID && grid.comm_rank == ROOT_PROC) {
+        StoreDataIntoFile(file_id, parResult, materialProperties.edgeSize,
+			iter / parameters.diskWriteIntensity, iter);
+      }
     }
-*/
 
     /* Receive halo zones. */
     for (std::size_t i = 0; i < NDIMS * NDIMS; ++i) {
@@ -593,8 +612,6 @@ void ParallelHeatDistribution(float                     *parResult,
 
     std::swap(tile.data_old, tile.data_new);
   }
-  /****************************************************************************/
-
 
   /* Finish measuring time. */
   board.comm.Barrier();
@@ -602,10 +619,11 @@ void ParallelHeatDistribution(float                     *parResult,
 
   /* Print final result. */
   if (board.comm_rank == ROOT_PROC) {
+    grid.comm.Recv(&middle_col.avg_temp, 1, MPI::DOUBLE, middle_col.root_grid_rank, TAG);
     if (!parameters.batchMode) {
       printf("\nExecution time of parallel version %.5f\n", elapsed_time);
     } else {
-      printf("%s;%s;%f;%e;%e\n", outputFileName.c_str(), "par", middle_col_avg_temp,
+      printf("%s;%s;%f;%e;%e\n", outputFileName.c_str(), "par", middle_col.avg_temp,
           	    elapsed_time, elapsed_time / parameters.nIterations);
     }
   }
@@ -624,15 +642,6 @@ void ParallelHeatDistribution(float                     *parResult,
   if (board.comm_rank == ROOT_PROC && file_id != H5I_INVALID_HID) {
     H5Fclose(file_id);
   }
-
-  //if (board.comm_rank == ROOT_PROC) {
-  //  for (int i = 0; i < materialProperties.edgeSize; ++i) {
-  //    for (int j = 0; j < materialProperties.edgeSize; ++j) {
-  //      printf("%3.3f ", parResult[i * materialProperties.edgeSize + j]);
-  //    }
-  //    putchar('\n');
-  //  }
-  //}
 } // end of ParallelHeatDistribution
 //------------------------------------------------------------------------------
 
