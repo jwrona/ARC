@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 module load intel/15.2.164
 

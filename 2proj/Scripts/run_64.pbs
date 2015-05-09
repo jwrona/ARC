@@ -21,7 +21,7 @@ stderrFile="err_64.txt"
 # get job name
 jobName=`qstat -u $USER | grep -E "^[0-9]+.*$" | cut -f 1 -d " " | tail -1`
 # here the hdf5 files are stored (local hard drive)
-playground=/lscratch/${jobName} 
+playground=/lscratch/${PBS_JOBID}
 
 # CSV output header
 echo "domainSize;nIterations;diskWriteIntensity;airflow;materialFile;simulationMode;simulationOutputFile;middleColAvgTemp;totalTime;iterationTime" > ${stdoutFile}
